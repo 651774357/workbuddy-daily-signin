@@ -1,0 +1,122 @@
+name: workbuddy-daily-signin
+
+# WorkBuddy 每日签到（方案三 · GitHub Actions）
+#
+# 设计原则（来自"AI经纬线"文章 07 节）：
+#   - 一天两次、非整点（GitHub 官方说整点会被延迟/丢弃）
+#   - 网络写 15s 重试（runner 在海外，访问腾讯域名抖动）
+#   - 失败必须看得见（飞书通知走 if: always()）
+#   - 凭据走 Secret：脚本读凭据 → 写临时文件 → 设环境变量 → 跑 auto
+#
+# 凭据约定：
+#   - Secret 名：WB_AUTH_JSON
+#   - 内容：~/.workbuddy/.../workbuddy-desktop.info 整份 JSON（明文）
+#   - 仓库必须私有
+#   - 凭据过期由本机 LaunchAgent 自动续期（见 local/）
+
+on:
+  schedule:
+    # 避开整点；一天两次保证「一天一定跑到」
+    - cron: '13 6 * * *'
+    - cron: '37 14 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'auto / status / doctor / all'
+        required: false
+        default: 'auto'
+
+# 不需要任何写入权限
+permissions: {}
+
+jobs:
+  signin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout signin repo
+        uses: actions/checkout@v4
+        with:
+          repository: 88lin/workbuddy-auto-signin
+          path: signin
+          fetch-depth: 1
+
+      - name: Make auth file from secret
+        env:
+          WB_AUTH_JSON: ${{ secrets.WB_AUTH_JSON }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${WB_AUTH_JSON}" ]; then
+            echo "::error::WB_AUTH_JSON secret is empty"
+            exit 1
+          fi
+          # 冒烟校验：必须是合法 JSON，且 accessToken 必须是明文字符串
+          if ! printf '%s' "${WB_AUTH_JSON}" | jq -e . >/dev/null 2>&1; then
+            echo "::error::WB_AUTH_JSON is not valid JSON"
+            exit 1
+          fi
+          printf '%s' "${WB_AUTH_JSON}" | jq -e '
+            (.auth.accessToken | type == "string") and
+            (.auth.accessToken | length > 0)
+          ' >/dev/null 2>&1 || {
+            echo "::error::WB_AUTH_JSON.accessToken must be a plaintext string (你导出的可能是加密态，请重新从本机导出)"
+            exit 1
+          }
+          # 落到临时文件，权限 600
+          umask 077
+          printf '%s' "${WB_AUTH_JSON}" > auth.json
+          echo "auth.json size: $(wc -c < auth.json) bytes (长度本身不回显内容)"
+
+      - name: Run signin
+        env:
+          WORKBUDDY_AUTH_FILE: ${{ github.workspace }}/auth.json
+          PYTHONIOENCODING: utf-8
+          WORKBUDDY_BUDGET_SECONDS: '420'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd signin
+          echo "action: ${{ inputs.action || 'auto' }}"
+          # 写操作（领取）失败/成功都不重试，让下次再跑；状态查询本身幂等可重试
+          python3 signin.py ${{ inputs.action || 'auto' }} || {
+            rc=$?
+            echo "::warning::signin.py exited with code ${rc}"
+            exit ${rc}
+          }
+
+      - name: Notify Feishu (always)
+        if: always()
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${FEISHU_WEBHOOK:-}" ]; then
+            echo "FEISHU_WEBHOOK not set, skip notification"
+            exit 0
+          fi
+          color='green'
+          title='签到成功'
+          [ "${JOB_STATUS}" != 'success' ] && color='red' && title='签到失败 · 请检查'
+          card_title="${title} (#${RUN_ID})"
+          curl -fsS -m 10 \
+            -H 'Content-Type: application/json' \
+            -X POST "${FEISHU_WEBHOOK}" \
+            -d "$(jq -n --arg t "${card_title}" --arg c "${color}" --arg s "${JOB_STATUS}" \
+              '{msg_type:"interactive",
+                card:{template:"blue", title:{content:"$title"},
+                  elements:[{tag:"div", text:{content:"Workflow: workbuddy-daily-signin"}},
+                            {tag:"div", text:{content:"Job status: " + $s}},
+                            {tag:"note", text:{content:"详情见 Actions 运行日志"}}]}}')" \
+            || echo "::warning::Feishu push failed, not failing the workflow"
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          # 删除临时凭据，避免被 runner 工作流落地显示下载
+          rm -f auth.json signin/.env 2>/dev/null || true
